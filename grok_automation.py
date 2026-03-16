@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """
-MindOfHikmah — Grok Video Automation
-Uses Playwright to automate Grok video generation for each scene.
-Logs into grok.com, generates each clip, downloads to output folder.
+MindOfHikmah — Grok Video Automation v2
+Fixed selector: tiptap ProseMirror div
+Clip duration: 6 seconds (Grok free tier)
 """
 import os, json, sys, time, logging, asyncio
 from pathlib import Path
@@ -23,8 +23,7 @@ log = logging.getLogger(__name__)
 
 CREDS_FILE = BASE_DIR / "credentials" / "grok_creds.json"
 SESSION_FILE = BASE_DIR / "credentials" / "grok_session.json"
-GROK_URL = "https://grok.com"
-VIDEO_URL = "https://grok.com"
+CLIP_DURATION = 6  # Grok free tier = 6 second clips
 
 
 def load_creds():
@@ -32,63 +31,7 @@ def load_creds():
         return json.load(f)
 
 
-async def login(page, email, password):
-    """Log into Grok using email/password via Google."""
-    log.info("Logging into Grok...")
-    await page.goto(GROK_URL, wait_until="networkidle")
-    await page.wait_for_timeout(2000)
-
-    # Check if already logged in
-    if await page.query_selector('[data-testid="user-menu"]') or \
-       await page.query_selector('textarea'):
-        log.info("Already logged in")
-        return True
-
-    # Click Sign In
-    sign_in = await page.query_selector('a[href*="signin"], button:has-text("Sign in"), a:has-text("Sign in")')
-    if sign_in:
-        await sign_in.click()
-        await page.wait_for_timeout(2000)
-
-    # Try Google login button
-    google_btn = await page.query_selector('button:has-text("Google"), a:has-text("Google"), [data-provider="google"]')
-    if google_btn:
-        await google_btn.click()
-        await page.wait_for_timeout(3000)
-
-        # Google login flow
-        email_input = await page.wait_for_selector('input[type="email"]', timeout=10000)
-        await email_input.fill(email)
-        await page.keyboard.press("Enter")
-        await page.wait_for_timeout(2000)
-
-        password_input = await page.wait_for_selector('input[type="password"]', timeout=10000)
-        await password_input.fill(password)
-        await page.keyboard.press("Enter")
-        await page.wait_for_timeout(5000)
-
-        # Handle 2FA or verification if needed
-        await page.wait_for_timeout(3000)
-        log.info("Google login completed")
-        return True
-
-    # Fallback: direct email/password
-    email_input = await page.query_selector('input[type="email"], input[name="email"]')
-    if email_input:
-        await email_input.fill(email)
-        pwd_input = await page.query_selector('input[type="password"]')
-        if pwd_input:
-            await pwd_input.fill(password)
-        await page.keyboard.press("Enter")
-        await page.wait_for_timeout(5000)
-        return True
-
-    log.error("Could not find login button")
-    return False
-
-
 async def save_session(context):
-    """Save browser session cookies for reuse."""
     cookies = await context.cookies()
     with open(SESSION_FILE, "w") as f:
         json.dump(cookies, f)
@@ -96,7 +39,6 @@ async def save_session(context):
 
 
 async def load_session(context):
-    """Load saved session cookies."""
     if not SESSION_FILE.exists():
         return False
     try:
@@ -109,106 +51,263 @@ async def load_session(context):
         return False
 
 
-async def generate_video_clip(page, prompt, output_path, scene_num, max_retries=3):
-    """Generate one video clip in Grok and download it."""
-    log.info(f"  Scene {scene_num}: Generating video clip...")
+async def login(page, email, password):
+    log.info("Logging into Grok...")
+    await page.goto("https://grok.com", wait_until="networkidle")
+    await page.wait_for_timeout(3000)
 
+    # Check if already logged in — look for ProseMirror editor
+    editor = await page.query_selector('.ProseMirror, .tiptap')
+    if editor:
+        log.info("Already logged in")
+        return True
+
+    # Click Sign In
+    sign_in = await page.query_selector('a[href*="signin"], button:has-text("Sign in"), a:has-text("Sign in"), button:has-text("Log in")')
+    if sign_in:
+        await sign_in.click()
+        await page.wait_for_timeout(2000)
+
+    # Google login
+    google_btn = await page.query_selector('button:has-text("Google"), a:has-text("Google"), [data-provider="google"]')
+    if google_btn:
+        await google_btn.click()
+        await page.wait_for_timeout(3000)
+        email_input = await page.wait_for_selector('input[type="email"]', timeout=10000)
+        await email_input.fill(email)
+        await page.keyboard.press("Enter")
+        await page.wait_for_timeout(2000)
+        password_input = await page.wait_for_selector('input[type="password"]', timeout=10000)
+        await password_input.fill(password)
+        await page.keyboard.press("Enter")
+        await page.wait_for_timeout(5000)
+        log.info("Google login completed")
+        return True
+
+    log.error("Could not find login button")
+    return False
+
+
+async def type_into_prosemirror(page, text):
+    """Type text into Grok's ProseMirror/tiptap editor."""
+    # Click the editor
+    editor = await page.wait_for_selector('.tiptap.ProseMirror, .ProseMirror', timeout=15000)
+    await editor.click()
+    await page.wait_for_timeout(500)
+
+    # Clear existing content
+    await page.keyboard.press("Control+a")
+    await page.keyboard.press("Delete")
+    await page.wait_for_timeout(300)
+
+    # Type the prompt
+    await editor.type(text, delay=10)
+    await page.wait_for_timeout(500)
+
+
+async def find_and_click_send(page):
+    """Find and click the send/submit button."""
+    # Try various send button selectors
+    selectors = [
+        'button[aria-label*="Send"]',
+        'button[aria-label*="send"]',
+        'button[type="submit"]',
+        'button:has-text("Send")',
+        '[data-testid="send-button"]',
+        'button.send-button',
+        # SVG arrow button
+        'button svg[data-icon*="arrow"], button svg[data-icon*="send"]',
+    ]
+    for sel in selectors:
+        btn = await page.query_selector(sel)
+        if btn:
+            await btn.click()
+            log.info(f"  Clicked send button: {sel}")
+            return True
+
+    # Fallback: press Enter
+    log.info("  Send button not found, pressing Enter")
+    await page.keyboard.press("Enter")
+    return True
+
+
+async def wait_for_video(page, timeout_ms=300000):
+    """Wait for Grok to finish generating the video."""
+    log.info("  Waiting for video generation...")
+
+    # First wait for any loading indicator to appear
+    await page.wait_for_timeout(3000)
+
+    # Wait for video element or download button
+    try:
+        # Try video element first
+        video = await page.wait_for_selector(
+            'video, video source, [data-testid*="video"]',
+            timeout=timeout_ms
+        )
+        if video:
+            await page.wait_for_timeout(2000)
+            return "video"
+    except Exception:
+        pass
+
+    # Try download button
+    try:
+        download_btn = await page.wait_for_selector(
+            'button[aria-label*="Download"], button[aria-label*="download"], a[download]',
+            timeout=30000
+        )
+        if download_btn:
+            return "download_button"
+    except Exception:
+        pass
+
+    return None
+
+
+async def download_video(page, output_path):
+    """Download the generated video."""
+    # Method 1: Download button
+    download_btn = await page.query_selector(
+        'button[aria-label*="Download"], button[aria-label*="download"], a[download], button:has-text("Download")'
+    )
+    if download_btn:
+        try:
+            async with page.expect_download(timeout=60000) as download_info:
+                await download_btn.click()
+            download = await download_info.value
+            await download.save_as(str(output_path))
+            log.info(f"  Downloaded via button: {output_path.name}")
+            return True
+        except Exception as e:
+            log.warning(f"  Button download failed: {e}")
+
+    # Method 2: Get video src directly
+    try:
+        video_src = await page.evaluate("""() => {
+            const v = document.querySelector('video');
+            if (!v) return null;
+            return v.src || (v.querySelector('source') ? v.querySelector('source').src : null);
+        }""")
+        if video_src and video_src.startswith("http") and not video_src.startswith("blob"):
+            import urllib.request
+            urllib.request.urlretrieve(video_src, str(output_path))
+            log.info(f"  Downloaded via URL: {output_path.name}")
+            return True
+    except Exception as e:
+        log.warning(f"  URL download failed: {e}")
+
+    # Method 3: Intercept blob URL
+    try:
+        video_data = await page.evaluate("""async () => {
+            const v = document.querySelector('video');
+            if (!v || !v.src) return null;
+            if (v.src.startsWith('blob:')) {
+                const resp = await fetch(v.src);
+                const buf = await resp.arrayBuffer();
+                return Array.from(new Uint8Array(buf));
+            }
+            return null;
+        }""")
+        if video_data:
+            output_path.write_bytes(bytes(video_data))
+            log.info(f"  Downloaded via blob: {output_path.name}")
+            return True
+    except Exception as e:
+        log.warning(f"  Blob download failed: {e}")
+
+    return False
+
+
+def build_grok_prompt(scene, script):
+    """Build a 6-second Grok video prompt."""
+    scientist = script.get("scientist_name", "the scholar")
+    character = script.get("character_description", "")
+    era = script.get("era", "")
+
+    prompt = f"""Generate a 6 second cinematic video clip. No dialogue. No text in frame.
+
+VISUAL: {scene.get('image_prompt', '')}
+
+SETTING: {scene.get('setting', '')}
+MOOD: {scene.get('mood', 'dramatic')}
+ERA: {era}
+
+CHARACTER: {character}
+
+STYLE: ARRI Alexa 35mm anamorphic. Heavy film grain. Deep teal shadows, warm amber highlights. Kingdom of Heaven / Ridley Scott epic. Photorealistic. 24fps.
+
+CRITICAL: Silent scene. No words, no subtitles, no modern elements. Voiceover added separately."""
+
+    return prompt
+
+
+async def generate_one_clip(page, scene, script, output_path, max_retries=3):
+    """Generate a single video clip."""
     for attempt in range(max_retries):
         try:
-            # Navigate to Grok
-            await page.goto(GROK_URL, wait_until="networkidle")
+            log.info(f"  Attempt {attempt+1}/{max_retries}")
+
+            # Navigate fresh for each clip
+            await page.goto("https://grok.com", wait_until="networkidle")
             await page.wait_for_timeout(3000)
 
-            # Find the input/prompt area
-            textarea = await page.wait_for_selector(
-                'textarea, div[contenteditable="true"], input[type="text"]',
-                timeout=15000
-            )
+            # Build prompt
+            prompt = build_grok_prompt(scene, script)
 
-            # Clear and type the video prompt
-            await textarea.click()
-            await page.keyboard.press("Control+a")
-            await page.keyboard.press("Delete")
-            await page.wait_for_timeout(500)
-
-            # Type the video generation prompt
-            video_prompt = f"/video {prompt}"
-            await textarea.type(video_prompt, delay=20)
+            # Type into editor
+            await type_into_prosemirror(page, prompt)
             await page.wait_for_timeout(1000)
-            await page.keyboard.press("Enter")
 
-            log.info(f"  Scene {scene_num}: Prompt submitted, waiting for generation...")
+            # Take screenshot to debug
+            await page.screenshot(path=f'/tmp/grok_before_send_{scene["number"]}.png')
 
-            # Wait for video to generate (can take 1-3 minutes)
-            video_element = await page.wait_for_selector(
-                'video, [data-testid="video-result"], .video-result',
-                timeout=300000  # 5 min timeout
-            )
+            # Send
+            await find_and_click_send(page)
 
-            if not video_element:
-                log.warning(f"  Scene {scene_num}: No video element found, retrying...")
+            # Wait for video
+            result = await wait_for_video(page, timeout_ms=300000)
+
+            if not result:
+                log.warning(f"  No video found on attempt {attempt+1}")
+                await page.screenshot(path=f'/tmp/grok_after_wait_{scene["number"]}.png')
                 continue
 
-            await page.wait_for_timeout(3000)
-
-            # Try to find download button
-            download_btn = await page.query_selector(
-                'button[aria-label*="download"], button:has-text("Download"), a[download]'
-            )
-
-            if download_btn:
-                # Set up download handler
-                async with page.expect_download(timeout=60000) as download_info:
-                    await download_btn.click()
-                download = await download_info.value
-                await download.save_as(str(output_path))
-                log.info(f"  Scene {scene_num}: Downloaded via button to {output_path}")
-                return True
-
-            # Fallback: get video src and download directly
-            video_src = await page.eval_on_selector(
-                'video',
-                'el => el.src || el.querySelector("source")?.src'
-            )
-
-            if video_src and video_src.startswith("http"):
-                import urllib.request
-                urllib.request.urlretrieve(video_src, str(output_path))
-                log.info(f"  Scene {scene_num}: Downloaded via URL to {output_path}")
-                return True
-
-            log.warning(f"  Scene {scene_num}: Could not download, attempt {attempt+1}/{max_retries}")
-            await page.wait_for_timeout(5000)
+            # Download
+            success = await download_video(page, output_path)
+            if success:
+                size = output_path.stat().st_size if output_path.exists() else 0
+                if size > 10000:
+                    log.info(f"  Clip saved: {size//1024}KB")
+                    return True
+                else:
+                    log.warning(f"  File too small: {size} bytes")
 
         except Exception as e:
-            log.error(f"  Scene {scene_num}: Error on attempt {attempt+1}: {e}")
+            log.error(f"  Attempt {attempt+1} error: {e}")
+            await page.screenshot(path=f'/tmp/grok_error_{scene["number"]}_{attempt}.png')
             await page.wait_for_timeout(5000)
 
-    log.error(f"  Scene {scene_num}: All attempts failed")
     return False
 
 
 async def run_grok_automation(script_path: Path, output_dir: Path):
-    """Main automation: generate all video clips for an episode."""
+    """Main automation function."""
     from playwright.async_api import async_playwright
 
-    # Load script
     with open(script_path) as f:
         script = json.load(f)
 
     scenes = script.get("scenes", [])
     scientist = script.get("scientist_name", "Scholar")
-    log.info(f"Generating {len(scenes)} clips for: {scientist}")
+    log.info(f"Generating clips for: {scientist} ({len(scenes)} scenes)")
 
     clips_dir = output_dir / "grok_clips"
     clips_dir.mkdir(exist_ok=True)
 
     creds = load_creds()
-    email = creds["grok_email"]
-    password = creds["grok_password"]
 
     async with async_playwright() as p:
-        # Launch browser (headless for server)
         browser = await p.chromium.launch(
             headless=True,
             args=[
@@ -216,134 +315,81 @@ async def run_grok_automation(script_path: Path, output_dir: Path):
                 "--disable-setuid-sandbox",
                 "--disable-dev-shm-usage",
                 "--disable-gpu",
-                "--window-size=1920,1080"
             ]
         )
-
         context = await browser.new_context(
             viewport={"width": 1920, "height": 1080},
-            user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
+            user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36"
         )
 
+        # Load or create session
+        session_loaded = await load_session(context)
         page = await context.new_page()
 
-        # Try loading saved session first
-        session_loaded = await load_session(context)
-
-        # Verify session is still valid
         if session_loaded:
-            await page.goto(GROK_URL, wait_until="networkidle")
+            await page.goto("https://grok.com", wait_until="networkidle")
             await page.wait_for_timeout(2000)
-            is_logged_in = await page.query_selector('textarea, [data-testid="user-menu"]')
-            if not is_logged_in:
+            editor = await page.query_selector('.ProseMirror, .tiptap')
+            if not editor:
                 log.info("Session expired, logging in again...")
                 session_loaded = False
 
         if not session_loaded:
-            success = await login(page, email, password)
+            success = await login(page, creds["grok_email"], creds["grok_password"])
             if not success:
-                log.error("Login failed — check credentials")
+                log.error("Login failed")
                 await browser.close()
                 return []
             await save_session(context)
 
-        # Generate each scene
         results = []
         for scene in scenes:
             n = scene["number"]
             scene_type = scene.get("type", "narrative")
 
-            # Skip title and end cards — use fallback images for those
             if scene_type in ("title", "end"):
-                log.info(f"  Scene {n}: Skipping {scene_type} card (will use styled frame)")
-                results.append({"scene": n, "status": "skipped", "type": scene_type})
+                log.info(f"Scene {n}: Skipping {scene_type} card")
+                results.append({"scene": n, "status": "skipped"})
                 continue
 
             clip_path = clips_dir / f"scene_{n:03d}.mp4"
 
-            # Skip if already generated
             if clip_path.exists() and clip_path.stat().st_size > 50000:
-                log.info(f"  Scene {n}: Already exists, skipping")
+                log.info(f"Scene {n}: Already exists ({clip_path.stat().st_size//1024}KB)")
                 results.append({"scene": n, "status": "cached", "path": str(clip_path)})
                 continue
 
-            # Build the Grok video prompt
-            grok_prompt = build_grok_prompt(scene, script)
-
-            success = await generate_video_clip(page, grok_prompt, clip_path, n)
+            log.info(f"Scene {n}: {scene.get('name', '')} — {scene.get('mood', '')}")
+            success = await generate_one_clip(page, scene, script, clip_path)
 
             if success:
                 results.append({"scene": n, "status": "generated", "path": str(clip_path)})
+                log.info(f"Scene {n}: SUCCESS")
             else:
                 results.append({"scene": n, "status": "failed"})
+                log.warning(f"Scene {n}: FAILED — will use fallback image")
 
-            # Rate limiting — wait between generations
-            log.info(f"  Scene {n}: Waiting 15s before next clip...")
-            await page.wait_for_timeout(15000)
+            # Wait between clips to avoid rate limiting
+            if n < len(scenes):
+                log.info("Waiting 20s before next clip...")
+                await page.wait_for_timeout(20000)
 
         await browser.close()
 
-    # Save results
-    results_file = output_dir / "grok_results.json"
-    with open(results_file, "w") as f:
+    # Summary
+    generated = sum(1 for r in results if r["status"] == "generated")
+    cached = sum(1 for r in results if r["status"] == "cached")
+    failed = sum(1 for r in results if r["status"] == "failed")
+    log.info(f"Complete: {generated} generated, {cached} cached, {failed} failed")
+
+    with open(output_dir / "grok_results.json", "w") as f:
         json.dump(results, f, indent=2)
 
-    generated = [r for r in results if r["status"] == "generated"]
-    failed = [r for r in results if r["status"] == "failed"]
-
-    log.info(f"Grok automation complete:")
-    log.info(f"  Generated: {len(generated)}")
-    log.info(f"  Cached:    {len([r for r in results if r['status'] == 'cached'])}")
-    log.info(f"  Skipped:   {len([r for r in results if r['status'] == 'skipped'])}")
-    log.info(f"  Failed:    {len(failed)}")
-
-    if failed:
-        log.warning(f"Failed scenes: {[r['scene'] for r in failed]}")
-
     return results
-
-
-def build_grok_prompt(scene, script):
-    """Build a cinematic Grok video prompt from a scene."""
-    scientist = script.get("scientist_name", "the scholar")
-    character = script.get("character_description", "")
-    era = script.get("era", "")
-
-    base_prompt = f"""Generate a {scene.get('duration_seconds', 10)} second cinematic video clip.
-
-VISUAL:
-{scene.get('image_prompt', scene.get('visual_description', ''))}
-
-CHARACTER (must be consistent):
-{character}
-Era: {era}
-
-TECHNICAL:
-- Shot on ARRI Alexa 35mm anamorphic lens
-- 8K Ultra HD, 24fps
-- Heavy film grain
-- Color grade: deep teal shadows #0D2137, warm amber highlights #F5C842
-- Mood: {scene.get('mood', 'cinematic')}
-- Setting: {scene.get('setting', '')}
-
-CRITICAL:
-- NO dialogue, NO text in frame, NO modern elements
-- NO subtitles or captions
-- Character mouth may move naturally but NO words
-- Voiceover added externally
-- Must feel like Kingdom of Heaven / Ridley Scott period epic"""
-
-    return base_prompt
-
-
-def run(script_path: str, output_dir: str):
-    """Entry point."""
-    asyncio.run(run_grok_automation(Path(script_path), Path(output_dir)))
 
 
 if __name__ == "__main__":
     if len(sys.argv) < 3:
         print("Usage: python3 grok_automation.py <script.json> <output_dir>")
-        print("Example: python3 grok_automation.py output/MOH_xxx/script.json output/MOH_xxx/")
         sys.exit(1)
-    run(sys.argv[1], sys.argv[2])
+    asyncio.run(run_grok_automation(Path(sys.argv[1]), Path(sys.argv[2])))
